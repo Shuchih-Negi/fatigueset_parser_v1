@@ -1,0 +1,24 @@
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- Sensor raw data (too large for git) ---
+raw/fatigueset/
+
+# --- Internal spec (not for public distribution) ---
+master_fatigueset.md
+
+# --- Environment ---
+.env
+venv/
+.venv/

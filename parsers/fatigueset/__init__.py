@@ -1,0 +1,1 @@
+"""FatigueSet parser module."""

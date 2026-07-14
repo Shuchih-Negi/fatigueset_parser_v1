@@ -1,0 +1,46 @@
+dataset: fatigueset
+raw_root: raw/fatigueset
+subjects: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+sessions_per_subject: 3
+ecg_waveform_file: chest_raw_ecg.csv
+rr_interval_file: chest_rr_interval.csv
+precomputed_summary_file: chest_physiology_summary.csv   # cross-check only
+invalid_ecg_value: 4095
+ecg_bit_to_mv: 0.0067025
+
+# --- marker: session -> physical intensity level (per participant) ---
+metadata_file: metadata.csv
+metadata_join_key: participant_id
+# metadata.csv columns: participant_id, low_session, medium_session, high_session
+# -> invert per participant to get {session_number: intensity_level}
+
+# --- PRIMARY LABEL: per-window fatigue rating from exp_fatigue.csv ---
+label_file: exp_fatigue.csv
+label_type: fatigue_rating
+label_scope: per_window  # Changed from per_session; join by timestamp
+exp_fatigue_physical_field: physicalFatigueScore      # Use physical fatigue as primary label
+exp_fatigue_mental_field: mentalFatigueScore          # Secondary option
+exp_fatigue_timestamp_field: fatigueSurveySubmissionTime  # in seconds
+
+# --- task markers: used for task-aligned windowing via exp_markers.csv ---
+# exp_markers.csv contains per-session task block boundaries
+# (start_baseline, end_baseline, start_activity, end_activity, etc.)
+exp_markers_file: exp_markers.csv
+use_task_markers: true
+ecg_sample_rate_hz: 250.0
+
+# --- secondary covariate: pre-task survey (baseline sleepiness) ---
+survey_file: pre_task_survey.xlsx
+survey_join_keys: [ID, Session]
+survey_sss_field: "Please indicate your current level of sleepiness."
+survey_gvas_field: "How sleepy do you feel?"
+sss_text_map:
+  "Feeling active and vital; alert; wide awake.": 1
+  "Functioning at a high level, but not at peak; able to concentrate.": 2
+  "Relaxed; awake; not at full alertness; responsive.": 3
+  "A little foggy; not at peak; let down.": 4
+
+# --- windowing ---
+window_seconds: 30
+overlap_seconds: 0
+fatigue_timestamp_tolerance_seconds: 5  # Window matching tolerance for fatigue scores
