@@ -44,3 +44,7 @@ sss_text_map:
 window_seconds: 30
 overlap_seconds: 0
 fatigue_timestamp_tolerance_seconds: 5  # Window matching tolerance for fatigue scores
+
+# --- LF/HF computation (2-minute windows) ---
+lf_hf_window_seconds: 120       # LF/HF window duration in seconds (2 minutes)
+lf_hf_min_confidence_seconds: 90  # Minimum RR data duration for reliable LF/HF (below = low_confidence=True)

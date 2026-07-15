@@ -15,30 +15,34 @@ def compute_features(
     ecg_waveform: Optional[np.ndarray] = None,
     invalid_value: int = 4095,
     sample_rate_hz: float = 250.0,
+    include_lf_hf: bool = True,
 ) -> Dict[str, float]:
     """
     Compute HR and HRV features from R-R intervals and optional raw ECG.
 
     Args:
         rr_intervals_ms: array of R-R interval durations in milliseconds
-        ecg_waveform: optional array of raw ECG samples (12-bit values)
+        ecg_waveform: optional array of raw ECG samples (12-bit values).
+                      Pass None if ECG data is unavailable for this window.
         invalid_value: sentinel value for invalid ECG samples (e.g., 4095 for 12-bit overflow)
         sample_rate_hz: ECG sampling rate in Hz (default 250 for Zephyr BioHarness)
+        include_lf_hf: whether to compute LF/HF (default True; set False for 30s windows)
 
     Returns:
         dict with keys:
             - hr: heart rate in beats per minute
             - rmssd: root mean square of successive RR differences, in ms
             - sdnn: standard deviation of RR intervals, in ms
-            - lf_hf: ratio of low-frequency to high-frequency power
-            - data_quality: "valid" if < 10% invalid samples, else "artefact"
+            - lf_hf: ratio of low-frequency to high-frequency power (NaN if not computed)
+            - data_quality: "valid" if < 10% invalid samples, "artefact" if > 10%,
+                            or "unknown" if ECG data was not available for this window
     """
     result = {
         "hr": np.nan,
         "rmssd": np.nan,
         "sdnn": np.nan,
         "lf_hf": np.nan,
-        "data_quality": "valid",
+        "data_quality": "unknown" if ecg_waveform is None else "valid",
     }
 
     # --- HR: beats per minute ---
@@ -64,7 +68,7 @@ def compute_features(
             result["sdnn"] = np.std(valid_rr)
 
     # --- LF/HF: low-frequency to high-frequency power ratio ---
-    if len(rr_intervals_ms) > 1:
+    if include_lf_hf and len(rr_intervals_ms) > 1:
         valid_rr = rr_intervals_ms[~np.isnan(rr_intervals_ms)]
         if len(valid_rr) > 10:  # need minimum samples for FFT
             result["lf_hf"] = _compute_lf_hf_ratio(valid_rr)
@@ -76,6 +80,41 @@ def compute_features(
             result["data_quality"] = "artefact"
 
     return result
+
+
+def compute_lf_hf(
+    rr_intervals_ms: np.ndarray,
+    min_samples: int = 10,
+) -> Tuple[float, float, bool]:
+    """
+    Compute LF/HF ratio with confidence information.
+
+    Args:
+        rr_intervals_ms: array of RR intervals in milliseconds
+        min_samples: minimum number of RR intervals needed for reliable computation
+
+    Returns:
+        Tuple of (lf_hf_ratio, actual_rr_duration_sec, low_confidence)
+        - lf_hf_ratio: computed LF/HF ratio (NaN if not computable)
+        - actual_rr_duration_sec: time span of RR data used (sum of RR intervals in seconds)
+        - low_confidence: True if actual_rr_duration_sec < 90s (less than 90s of RR data)
+    """
+    if len(rr_intervals_ms) < min_samples:
+        return np.nan, 0.0, True
+
+    valid_rr = rr_intervals_ms[~np.isnan(rr_intervals_ms)]
+    if len(valid_rr) < min_samples:
+        return np.nan, 0.0, True
+
+    # Compute actual RR duration covered
+    actual_duration_sec = np.sum(valid_rr) / 1000.0
+
+    # Low confidence if less than 90s of RR data (standard 2-min window is 120s)
+    low_confidence = actual_duration_sec < 90.0
+
+    lf_hf = _compute_lf_hf_ratio(valid_rr)
+
+    return lf_hf, actual_duration_sec, low_confidence
 
 
 def _compute_lf_hf_ratio(rr_intervals_ms: np.ndarray) -> float:

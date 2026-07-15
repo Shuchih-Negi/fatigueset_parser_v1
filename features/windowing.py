@@ -3,6 +3,10 @@ Windowing utilities for time-series data.
 
 Dataset-agnostic slicing of signals and event series into fixed-duration windows.
 Handles both fixed-time windowing and task-aligned windowing (if markers provided).
+
+Window boundaries are defined purely by markers + config width. No sensor file's
+health should be able to zero out a session's window count. Data extraction into
+windows happens outside this module.
 """
 
 import pandas as pd
@@ -63,65 +67,127 @@ def extract_task_blocks(
     return blocks
 
 
-def window_generator(
-    timestamps: np.ndarray,
-    signals_dict: Dict[str, np.ndarray],
-    window_seconds: float,
-    overlap_seconds: float = 0.0,
+def window_boundaries(
     task_markers: Optional[pd.DataFrame] = None,
-) -> Iterator[Tuple[float, float, int, Dict[str, np.ndarray]]]:
+    signal_start_sec: float = 0.0,
+    signal_end_sec: float = 0.0,
+    window_seconds: float = 30.0,
+    overlap_seconds: float = 0.0,
+) -> Iterator[Tuple[float, float, int]]:
     """
-    Generate consecutive (or task-aligned) time windows from signals.
+    Generate window boundaries from markers or full signal range.
+
+    Windows exist purely because markers say a block exists and config says
+    how wide to slice it. No sensor file health affects window generation.
 
     Args:
-        timestamps: array of timestamps (in seconds or milliseconds; must be consistent with signals)
-        signals_dict: dict mapping signal name (str) to array of values, same length as timestamps
+        task_markers: DataFrame with [utcTime, eventMarker] for task-aligned windowing.
+                      If provided and valid, windows are generated within block boundaries.
+        signal_start_sec: start of signal range (used only when task_markers is None)
+        signal_end_sec: end of signal range (used only when task_markers is None)
         window_seconds: window duration in seconds
-        overlap_seconds: overlap between consecutive windows in seconds (0 for no overlap)
-        task_markers: optional DataFrame with columns [utcTime, eventMarker] for task-aligned windowing.
-                      If provided, windows are generated only within task block boundaries,
-                      skipping inter-block gaps. If None, use fixed-time windowing over the full signal range.
+        overlap_seconds: overlap between consecutive windows (0 for non-overlapping)
 
     Yields:
-        (window_start_ts, window_end_ts, block_index, data_for_window)
-        where data_for_window is a dict with same keys as signals_dict,
-        containing only samples within [window_start_ts, window_end_ts].
-        block_index is -1 for fixed-time windowing, or the index of the task block
-        (0, 1, 2, ...) for task-aligned windowing.
+        (window_start_sec, window_end_sec, block_index)
+        block_index is -1 for fixed-time, or block ordinal (0, 1, 2, ...) for task-aligned.
     """
-    if len(timestamps) == 0:
-        return
-
-    timestamps = _normalize_timestamps(timestamps)
-
     window_step = window_seconds - overlap_seconds
 
     task_blocks = extract_task_blocks(task_markers) if task_markers is not None else []
     use_task = task_markers is not None and len(task_markers) > 0 and len(task_blocks) > 0
 
     if not use_task:
-        window_start = timestamps.min()
-        while window_start < timestamps.max():
+        window_start = signal_start_sec
+        while window_start + window_seconds <= signal_end_sec:
             window_end = window_start + window_seconds
-            mask = (timestamps >= window_start) & (timestamps < window_end)
-            if mask.any():
-                data_for_window = {
-                    signal_name: signal_array[mask]
-                    for signal_name, signal_array in signals_dict.items()
-                }
-                yield window_start, window_end, -1, data_for_window
+            yield (window_start, window_end, -1)
             window_start += window_step
     else:
-        # Task-aligned windowing: generate windows only within task blocks
         for block_idx, (block_start, block_end) in enumerate(task_blocks):
             window_start = block_start
-            while window_start < block_end:
-                window_end = min(window_start + window_seconds, block_end)
-                mask = (timestamps >= window_start) & (timestamps < window_end)
-                if mask.any():
-                    data_for_window = {
-                        signal_name: signal_array[mask]
-                        for signal_name, signal_array in signals_dict.items()
-                    }
-                    yield window_start, window_end, block_idx, data_for_window
+            while window_start + window_seconds <= block_end:
+                window_end = window_start + window_seconds
+                yield (window_start, window_end, block_idx)
                 window_start += window_step
+
+
+def lf_hf_window_boundaries(
+    task_markers: Optional[pd.DataFrame] = None,
+    signal_start_sec: float = 0.0,
+    signal_end_sec: float = 0.0,
+    window_seconds: float = 120.0,
+) -> Iterator[Tuple[float, float, int]]:
+    """
+    Generate 2-minute LF/HF window boundaries from markers or full signal range.
+
+    Args:
+        task_markers: DataFrame with [utcTime, eventMarker]
+        signal_start_sec: start of signal range
+        signal_end_sec: end of signal range
+        window_seconds: LF/HF window duration (default 120s)
+
+    Yields:
+        (window_start_sec, window_end_sec, block_index)
+    """
+    task_blocks = extract_task_blocks(task_markers) if task_markers is not None else []
+    use_task = task_markers is not None and len(task_markers) > 0 and len(task_blocks) > 0
+
+    if not use_task:
+        window_start = signal_start_sec
+        while window_start + window_seconds <= signal_end_sec:
+            yield (window_start, window_start + window_seconds, -1)
+            window_start += window_seconds
+    else:
+        for block_idx, (block_start, block_end) in enumerate(task_blocks):
+            window_start = block_start
+            while window_start + window_seconds <= block_end:
+                yield (window_start, window_start + window_seconds, block_idx)
+                window_start += window_seconds
+
+
+def extract_signal_in_window(
+    timestamps_sec: np.ndarray,
+    signal: np.ndarray,
+    window_start: float,
+    window_end: float,
+) -> np.ndarray:
+    """
+    Extract signal values that fall within a time window.
+
+    Args:
+        timestamps_sec: array of timestamps in seconds (normalized to session start)
+        signal: array of values, same length as timestamps_sec
+        window_start: window start time in seconds
+        window_end: window end time in seconds
+
+    Returns:
+        Array of signal values within [window_start, window_end)
+    """
+    mask = (timestamps_sec >= window_start) & (timestamps_sec < window_end)
+    return signal[mask]
+
+
+def compute_rr_duration_in_window(
+    rr_timestamps_sec: np.ndarray,
+    rr_durations: np.ndarray,
+    window_start: float,
+    window_end: float,
+) -> float:
+    """
+    Compute total duration of RR data present in a window.
+
+    Args:
+        rr_timestamps_sec: RR timestamps in seconds
+        rr_durations: RR interval durations in milliseconds
+        window_start: window start in seconds
+        window_end: window end in seconds
+
+    Returns:
+        Total RR data duration in seconds (sum of RR intervals within window)
+    """
+    mask = (rr_timestamps_sec >= window_start) & (rr_timestamps_sec < window_end)
+    rr_in_window = rr_durations[mask]
+    if len(rr_in_window) > 0:
+        return np.sum(rr_in_window) / 1000.0
+    return 0.0

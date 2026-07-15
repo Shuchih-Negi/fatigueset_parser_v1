@@ -18,6 +18,9 @@ raw/fatigueset/
 # --- Internal spec (not for public distribution) ---
 master_fatigueset.md
 
+# --- Working directories ---
+temp_output/
+
 # --- Environment ---
 .env
 venv/
