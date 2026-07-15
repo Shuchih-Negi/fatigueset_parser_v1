@@ -210,9 +210,6 @@ python parsers/fatigueset/parser2_combine.py
 
 Output: `datastore/fatigueset_final.csv` (749 rows, 100% label coverage)
 
-### Step 3: Exploratory Data Analysis
-
-Open `eda/eda_fatigueset_final.ipynb` in Jupyter Lab for visual exploration, correlation analysis, and distribution checks.
 
 ## Configuration (`configs/datasets/fatigueset.yaml`)
 
