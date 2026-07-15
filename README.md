@@ -9,7 +9,7 @@ FatigueSet is a multimodal dataset containing ECG (chest strap), RR intervals, a
 1. Loads raw ECG waveforms and RR intervals
 2. Applies **task-aligned windowing** using experiment markers (baseline, activity, fatigue blocks)
 3. Extracts HRV features (HR, RMSSD, SDNN, LF/HF) per window
-4. Joins **block-level physical and mental fatigue labels** from `exp_fatigue.csv` (with SSS fallback)
+4. Joins **block-level physical fatigue labels** from `exp_fatigue.csv` (with SSS fallback)
 5. Produces a clean, labeled tabular dataset ready for model training
 
 ## Pipeline Overview
@@ -24,12 +24,12 @@ raw/fatigueset/{subject}/{session}/
   pre_task_survey.xlsx ───┘
                                         │
                                         ▼
-                             features/ecg.py
+                              features/ecg.py
                     (hr, rmssd, sdnn, lf_hf, data_quality)
                                         │
                                         ▼
                      label + covariate join, per window
-         label:      exp_fatigue.csv block-pairing (label_physical + label_mental), SSS fallback
+         label:      exp_fatigue.csv block-pairing (physicalFatigueScore), SSS fallback
          covariates: sss_pretask, gvas_sleepy, intensity_level
                                         │
                                         ▼
@@ -40,27 +40,27 @@ raw/fatigueset/{subject}/{session}/
                                         │
                                         ▼
                   datastore/fatigueset_final.csv
-                  (749 rows, 100% label coverage)
+                  (677 rows, 100% label coverage)
                                         │
                                         ▼
-                 eda/eda_fatigueset_final.ipynb
+                 eda/eda_fatigueset_edit.ipynb
 ```
 
 **What happens at each stage:**
 
 1. **Raw inputs** — per-session sensor files (ECG waveform, RR intervals) and per-session experiment logs (task markers, fatigue check-ins), alongside root-level baseline surveys (SSS/GVAS) and the subject→intensity mapping.
-2. **Windowing** — `features/windowing.py` slices each session into fixed-length windows, aligned to task-block boundaries from `exp_markers.csv` rather than raw wall-clock time, so no window straddles a task transition.
-3. **Feature extraction** — `features/ecg.py` turns the RR intervals (and raw ECG waveform, for artefact detection) inside each window into `hr`, `rmssd`, `sdnn`, `lf_hf`, plus a `data_quality` flag.
+2. **Windowing** — `features/windowing.py` slices each session into fixed-length windows (30s), aligned to task-block boundaries from `exp_markers.csv`. Windows are defined purely from marker geometry — no sensor file's health can zero out a session's window count.
+3. **Feature extraction** — `features/ecg.py` extracts HR, RMSSD, SDNN from RR intervals inside each window. LF/HF is computed on separate 2-minute (120s) windows and inherited by every 30s window that falls within it (~4 rows share one identical lf_hf value). If a window's ECG waveform slice is empty/corrupted, `data_quality` is set to `unknown` for that window only.
 4. **Label + covariate join** — each window's task block is matched to its corresponding `exp_fatigue.csv` measurement (block-level pairing); sessions or blocks with no fatigue measurement fall back to the pre-task SSS value. Session-level covariates (`sss_pretask`, `gvas_sleepy`, `intensity_level`) are broadcast onto every window belonging to that session.
 5. **Per-subject assembly** — `parser1_participant.py` runs this full chain once per subject (steps 1–4), writing one labeled CSV per subject.
 6. **Combine** — `parser2_combine.py` concatenates all 12 subject CSVs into a single dataset.
-7. **EDA** — `eda_fatigueset_final.ipynb` consumes the final CSV for label distribution, missing-data checks, and feature range sanity checks.
+7. **EDA** — `eda_fatigueset_edit.ipynb` consumes the final CSV for label distribution, missing-data checks, and feature range sanity checks.
 
 ## Formulas & Label Construction
 
 ### ECG/HRV features (per window)
 
-Every window's `hr`/`rmssd`/`sdnn`/`lf_hf` come from the R-R intervals (ms) falling inside that window's time range.
+Every window's `hr`/`rmssd`/`sdnn` come from the R-R intervals (ms) falling inside that window's time range. LF/HF uses a separate 2-minute window (see below).
 
 **HR — heart rate**
 ```
@@ -80,22 +80,24 @@ RMSSD = sqrt( (1/(n-1)) * Σ (RR_(i+1) - RR_i)^2 )
 ```
 Takes the diff between each beat and the *next* beat, squares it, averages, square-roots. Reacts to fast beat-to-beat jitter; SDNN and RMSSD are not redundant — they pick up different timescales of variability.
 
-**LF/HF — frequency-domain HRV ratio**
-RR intervals aren't evenly spaced in time, so this isn't a plain FFT:
+**LF/HF — frequency-domain HRV ratio (2-minute windows)**
 ```
-1. Treat the window as (beat_timestamp, RR_duration) pairs
-2. Run a Lomb-Scargle periodogram (handles unevenly-spaced samples)
-3. Sum power in LF band (0.04–0.15 Hz) and HF band (0.15–0.4 Hz)
-4. LF/HF = LF_power / HF_power
+1. Define 120-second windows (lf_hf_window_seconds) from the session timeline
+2. Extract RR intervals within each 2-minute window
+3. If valid RR duration < 90 seconds (lf_hf_min_confidence_seconds), set lf_hf_low_confidence = True
+4. Run a Lomb-Scargle periodogram (handles unevenly-spaced samples)
+5. Sum power in LF band (0.04–0.15 Hz) and HF band (0.15–0.4 Hz)
+6. LF/HF = LF_power / HF_power
+7. Every 30s window inherits the lf_hf value from whichever 2-minute window it falls in
 ```
-With only ~25–30 beats in a 30s window, this ratio is noisy by nature — treat it as a rough covariate more than a precise measurement.
+With only ~25–30 beats in a 30s window, this ratio is noisy by nature — treat it as a rough covariate more than a precise measurement. The 2-minute window provides ~100 beats for a more stable estimate.
 
 **`data_quality` — artefact flag**
 ```
-artefact_fraction = (count of invalid samples, ecg_waveform == 4095) / (total samples in window)
-data_quality = "artefact" if artefact_fraction > threshold else "valid"
+data_quality = "unknown" if ecg_waveform is unavailable/corrupted (e.g. P01 S1)
+data_quality = "valid"   otherwise
 ```
-Not a fatigue feature — a gate on whether to trust the above numbers for that window.
+P01 Session 1 has corrupted ECG timestamps (all rows identical `1.62937E+12`), so its 27 windows are marked `unknown`. This is a per-window flag — other sessions and subjects are unaffected.
 
 ### Label construction — `exp_fatigue.csv`, block-level pairing
 
@@ -111,7 +113,7 @@ Not a fatigue feature — a gate on whether to trust the above numbers for that 
    label(window) = physicalFatigueScore of the exp_fatigue.csv row
                    paired with block_id(window)
    ```
-   This is what produces 100% label coverage (749/749 rows) — instead of only the ~3 windows per session nearest each raw measurement getting a value, the whole block those measurements represent gets labeled.
+   This is what produces 100% label coverage (677/677 rows) — instead of only the ~3 windows per session nearest each raw measurement getting a value, the whole block those measurements represent gets labeled.
 5. **Fallback**: if a session/block has no `exp_fatigue.csv` measurement at all, `label` = the session's Stanford Sleepiness Scale value instead, and `label_type` switches from `"fatigue_rating"` to `"sss_pretask"` for those rows.
 
 ### Stanford Sleepiness Scale — text-to-number mapping
@@ -154,9 +156,9 @@ so each `session_id` maps directly to an `intensity_level` string, broadcast to 
 │       └── parser2_combine.py       # Combine into final CSV
 ├── features/
 │   ├── ecg.py                       # ECG/HRV feature computation
-│   └── windowing.py                 # Sliding + task-aligned windowing
+│   └── windowing.py                 # Task-aligned windowing
 ├── eda/
-│   └── eda_fatigueset_final.ipynb   # Exploratory data analysis notebook
+│   └── eda_fatigueset_edit.ipynb    # Exploratory data analysis notebook
 ├── raw/
 │   ├── fatigueset/                  # Raw sensor data (not tracked in git)
 │   └── fatigueset_participants/     # Per-subject pipeline output CSVs
@@ -200,7 +202,7 @@ Optional arguments:
 - `--output-dir` — Output directory (default: `raw/fatigueset_participants`)
 - `--log-level` — DEBUG, INFO, WARNING, ERROR
 
-Each run produces a per-subject CSV (`P01.csv`, `P02.csv`, ...) with ~50–70 rows.
+Each run produces a per-subject CSV (`P01.csv`, `P02.csv`, ...) with ~45–72 rows.
 
 ### Step 2: Combine into Final Dataset
 
@@ -208,7 +210,7 @@ Each run produces a per-subject CSV (`P01.csv`, `P02.csv`, ...) with ~50–70 ro
 python parsers/fatigueset/parser2_combine.py
 ```
 
-Output: `datastore/fatigueset_final.csv` (749 rows, 100% label coverage)
+Output: `datastore/fatigueset_final.csv` (677 rows, 100% label coverage)
 
 
 ## Configuration (`configs/datasets/fatigueset.yaml`)
@@ -223,6 +225,8 @@ Output: `datastore/fatigueset_final.csv` (749 rows, 100% label coverage)
 | `invalid_ecg_value` | ECG invalid sample marker (4095) |
 | `label_type` | Label source name |
 | `fatigue_timestamp_tolerance_seconds` | Timestamp matching tolerance |
+| `lf_hf_window_seconds` | LF/HF computation window (120s) |
+| `lf_hf_min_confidence_seconds` | Minimum RR data for reliable LF/HF (90s) |
 
 ## Features (per-window)
 
@@ -231,17 +235,16 @@ Output: `datastore/fatigueset_final.csv` (749 rows, 100% label coverage)
 | `hr` | Mean heart rate (bpm) |
 | `rmssd` | Root mean square of successive RR differences (ms) |
 | `sdnn` | Standard deviation of NN intervals (ms) |
-| `lf_hf` | Low frequency / high frequency power ratio |
-| `data_quality` | Artifact flag (`valid` or `invalid`) |
+| `lf_hf` | Low frequency / high frequency power ratio (2-min window, inherited) |
+| `lf_hf_window_sec` | Actual duration of the 2-min LF/HF window used |
+| `lf_hf_low_confidence` | True if RR data < 90s in the LF/HF window |
+| `data_quality` | `valid` or `unknown` (corrupted ECG) |
 
 ## Labeling Strategy
 
-- **Primary sources (co-primary, both kept):**
-  - `physicalFatigueScore` from `exp_fatigue.csv` → `label_physical` (0–100 scale)
-  - `mentalFatigueScore` from `exp_fatigue.csv` → `label_mental` (0–100 scale)
-  - Neither is dropped in favor of the other — `physicalFatigueScore` tracks the low/medium/high intensity manipulation closely, while `mentalFatigueScore` is the target the original project roadmap specified for this dataset.
-- **Matching method:** Block-level pairing — task blocks come from `exp_markers.csv`; each `exp_fatigue.csv` measurement is assigned to the block it falls in, and every window in that block inherits both scores (not just the single nearest window).
-- **Fallback:** For any block with no paired `exp_fatigue.csv` measurement, both `label_physical` and `label_mental` fall back to that session's Stanford Sleepiness Scale (SSS) value from `pre_task_survey.xlsx`, and `label_type` is set to `"sss_pretask"` for just those rows (vs `"fatigue_rating"` where a real measurement applied).
+- **Primary source:** `physicalFatigueScore` from `exp_fatigue.csv` → `label` (0–100 scale)
+- **Matching method:** Block-level pairing — task blocks come from `exp_markers.csv`; each `exp_fatigue.csv` measurement is assigned to the block it falls in, and every window in that block inherits the score (not just the single nearest window).
+- **Fallback:** For any block with no paired `exp_fatigue.csv` measurement, `label` falls back to that session's Stanford Sleepiness Scale (SSS) value from `pre_task_survey.xlsx`, and `label_type` is set to `"sss_pretask"` for just those rows (vs `"fatigue_rating"` where a real measurement applied).
 
 ## Output Columns (final CSV)
 
@@ -250,27 +253,30 @@ Output: `datastore/fatigueset_final.csv` (749 rows, 100% label coverage)
 | `subject_id` | str | P01–P12 |
 | `session_id` | int | 1, 2, or 3 |
 | `window_start_sec` | float | Seconds from session start |
-| `hr` | float | Mean heart rate |
-| `rmssd` | float | HRV metric |
-| `sdnn` | float | HRV metric |
-| `lf_hf` | float | HRV metric |
-| `data_quality` | str | `valid` / `invalid` |
-| `label_physical` | float | Physical fatigue score (0–100) or SSS fallback |
-| `label_mental` | float | Mental fatigue score (0–100) or SSS fallback |
+| `hr` | float | Mean heart rate (bpm) |
+| `rmssd` | float | HRV metric (ms) |
+| `sdnn` | float | HRV metric (ms) |
+| `lf_hf` | float | LF/HF ratio (2-min window, inherited) |
+| `lf_hf_window_sec` | float | Actual duration of LF/HF computation window |
+| `lf_hf_low_confidence` | bool | True if RR data < 90s in LF/HF window |
+| `data_quality` | str | `valid` or `unknown` |
+| `label` | float | Physical fatigue score (0–100) or SSS fallback |
 | `label_type` | str | `fatigue_rating` or `sss_pretask` |
-| `sss_pretask` | float | Baseline sleepiness (1–7) |
-| `gvas_sleepy` | float | GVAS sleepiness score |
+| `sss_pretask` | float | Baseline sleepiness (1–4) |
+| `gvas_sleepy` | float | GVAS sleepiness score (0–6) |
 | `intensity_level` | str | `low` / `medium` / `high` |
 | `modality` | str | `ecg` |
 | `dataset` | str | `fatigueset` |
 
 ## Results
 
-- **749 total windows** across 12 subjects × 3 sessions
+- **677 total windows** across 12 subjects × 3 sessions
 - **100% label coverage** (0 NaN, thanks to block-level pairing + SSS fallback)
-- **`label_physical` range:** 0.00–77.22 (mean ≈ 34)
-- **`label_mental` range:** not yet summarized here — re-run the EDA notebook's distribution cell for `label_mental` before reporting, since it can diverge meaningfully from the physical score (see `eda_fatigueset_final.ipynb`)
-- **Balanced intensity levels:** high (263), medium (261), low (225)
+- **`label` range:** 0.00–77.22 (mean ≈ 34)
+- **`label_type`:** 677/677 `fatigue_rating` (all blocks paired, no SSS fallback needed)
+- **`data_quality`:** 650 `valid`, 27 `unknown` (P01 S1 — corrupted ECG timestamps)
+- **`lf_hf_low_confidence`:** 157/677 windows (23%) with < 90s RR data in their 2-min LF/HF window
+- **Balanced intensity levels:** medium (228), high (227), low (222)
 
 ## Dependencies
 
